@@ -1,0 +1,8 @@
+[phases.setup]
+cmds = ["apt-get update", "apt-get install -y ffmpeg"]
+
+[phases.install]
+cmds = ["pip install -r requirements.txt"]
+
+[start]
+cmd = "python bot.py"
