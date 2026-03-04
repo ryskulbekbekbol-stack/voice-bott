@@ -51,7 +51,7 @@ if not BOT_TOKEN:
 # Параметры видео
 VIDEO_WIDTH = 1280
 VIDEO_HEIGHT = 720
-FPS = 30
+FPS = 120
 MAX_DURATION = 60  # Максимальная длина видео (сек)
 MAX_FILE_SIZE = 45 * 1024 * 1024  # Telegram лимит ~50 MB, оставляем запас
 
