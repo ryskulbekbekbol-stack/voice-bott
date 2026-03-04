@@ -22,8 +22,7 @@ from datetime import datetime
 
 import numpy as np
 import librosa
-from moviepy.editor import VideoClip, AudioFileClip, CompositeVideoClip
-from moviepy.video.VideoClip import ColorClip
+from moviepy.editor import VideoClip, AudioFileClip
 import ffmpeg
 
 from telegram import Update
@@ -51,7 +50,7 @@ if not BOT_TOKEN:
 # Параметры видео
 VIDEO_WIDTH = 1280
 VIDEO_HEIGHT = 720
-FPS = 120
+FPS = 30
 MAX_DURATION = 60  # Максимальная длина видео (сек)
 MAX_FILE_SIZE = 45 * 1024 * 1024  # Telegram лимит ~50 MB, оставляем запас
 
@@ -80,7 +79,7 @@ class BeatVisualizer:
             sr=self.sr,
             units='time'
         )
-        self.beat_times = librosa.frames_to_time(self.beat_frames, sr=self.sr)
+        self.beat_times = self.beat_frames  # уже в секундах
         
         # Анализируем спектр для цветов
         self.spectral = librosa.feature.spectral_centroid(y=self.y, sr=self.sr)[0]
@@ -100,9 +99,9 @@ class BeatVisualizer:
         distance = abs(closest - t)
         
         # Энергия затухает после бита (гауссиан)
-        if distance < 0.1:
-            return math.exp(-distance * 50)  # резкий пик
-        return 0.2
+        if distance < 0.2:
+            return math.exp(-distance * 30)  # резкий пик
+        return 0.1
     
     def get_color(self, t: float) -> tuple:
         """
@@ -114,14 +113,14 @@ class BeatVisualizer:
             idx = 0
         
         # Частота влияет на оттенок (hue)
-        freq = self.spectral[idx]
+        freq = self.spectral[idx] if idx < len(self.spectral) else 2000
         hue = (freq / 5000) % 1.0  # нормализуем
         
         # Энергия бита влияет на яркость
         energy = self.get_beat_energy(t)
         
         # Конвертируем HSV в RGB
-        r, g, b = colorsys.hsv_to_rgb(hue, 0.8, 0.5 + energy * 0.5)
+        r, g, b = colorsys.hsv_to_rgb(hue, 0.8, 0.3 + energy * 0.7)
         return (int(r*255), int(g*255), int(b*255))
     
     def get_size(self, t: float) -> float:
@@ -129,7 +128,7 @@ class BeatVisualizer:
         Возвращает размер круга/элемента в момент t
         """
         energy = self.get_beat_energy(t)
-        return 0.3 + energy * 0.7  # от 30% до 100% экрана
+        return 0.2 + energy * 0.8  # от 20% до 100% экрана
     
     def make_frame(self, t: float) -> np.array:
         """
@@ -138,39 +137,44 @@ class BeatVisualizer:
         # Создаём пустой кадр
         frame = np.zeros((VIDEO_HEIGHT, VIDEO_WIDTH, 3), dtype=np.uint8)
         
+        # Задний фон
+        bg_color = self.get_color(t - 0.1)
+        frame[:, :] = [c // 4 for c in bg_color]
+        
         # Получаем цвет и размер
         color = self.get_color(t)
         size_factor = self.get_size(t)
+        energy = self.get_beat_energy(t)
         
         # Рисуем центральный круг
         center_x = VIDEO_WIDTH // 2
         center_y = VIDEO_HEIGHT // 2
-        radius = int(min(VIDEO_WIDTH, VIDEO_HEIGHT) * size_factor * 0.3)
+        radius = int(min(VIDEO_WIDTH, VIDEO_HEIGHT) * size_factor * 0.25)
         
-        # Векторизованное рисование круга (быстрее чем цикл)
+        # Векторизованное рисование круга
         Y, X = np.ogrid[:VIDEO_HEIGHT, :VIDEO_WIDTH]
         dist_from_center = np.sqrt((X - center_x)**2 + (Y - center_y)**2)
         mask = dist_from_center <= radius
-        
         frame[mask] = color
         
         # Добавляем внешнее кольцо если есть энергия
-        energy = self.get_beat_energy(t)
-        if energy > 0.6:
-            ring_radius = int(radius * 1.5)
-            ring_mask = (dist_from_center <= ring_radius) & (~mask)
-            # Более светлый цвет для кольца
-            ring_color = tuple(min(c + 50, 255) for c in color)
+        if energy > 0.4:
+            ring_radius = int(radius * 1.3)
+            ring_mask = (dist_from_center <= ring_radius) & (dist_from_center > radius)
+            ring_color = tuple(min(c + 30, 255) for c in color)
             frame[ring_mask] = ring_color
         
         # Добавляем случайные частицы на сильных битах
-        if energy > 0.8:
-            num_particles = int(energy * 20)
+        if energy > 0.7:
+            num_particles = int(energy * 30)
             for _ in range(num_particles):
-                px = random.randint(0, VIDEO_WIDTH-1)
-                py = random.randint(0, VIDEO_HEIGHT-1)
-                particle_color = tuple(min(c + 100, 255) for c in color)
-                frame[py, px] = particle_color
+                angle = random.uniform(0, 2 * math.pi)
+                dist = random.uniform(radius, VIDEO_WIDTH * 0.4)
+                px = int(center_x + math.cos(angle) * dist)
+                py = int(center_y + math.sin(angle) * dist)
+                if 0 <= px < VIDEO_WIDTH and 0 <= py < VIDEO_HEIGHT:
+                    particle_color = tuple(min(c + 80, 255) for c in color)
+                    frame[py, px] = particle_color
         
         return frame
     
@@ -181,11 +185,12 @@ class BeatVisualizer:
         output_path = self.work_dir / "visualizer.mp4"
         
         # Создаём видеоклип из функции make_frame
-        video_clip = VideoClip(self.make_frame, duration=min(self.duration, MAX_DURATION))
+        video_duration = min(self.duration, MAX_DURATION)
+        video_clip = VideoClip(self.make_frame, duration=video_duration)
         video_clip = video_clip.set_fps(FPS)
         
         # Добавляем аудио
-        audio_clip = AudioFileClip(str(self.audio_path)).subclip(0, min(self.duration, MAX_DURATION))
+        audio_clip = AudioFileClip(str(self.audio_path)).subclip(0, video_duration)
         final_clip = video_clip.set_audio(audio_clip)
         
         # Экспортируем с оптимизацией для Telegram
@@ -205,18 +210,6 @@ class BeatVisualizer:
         # Проверяем размер файла
         file_size = os.path.getsize(output_path)
         logger.info(f"✅ Видео создано: {output_path}, размер: {file_size/1024/1024:.1f} MB")
-        
-        # Если файл слишком большой, пережимаем
-        if file_size > MAX_FILE_SIZE:
-            logger.warning("⚠️ Файл слишком большой, пережимаю...")
-            compressed_path = self.work_dir / "visualizer_compressed.mp4"
-            (
-                ffmpeg
-                .input(str(output_path))
-                .output(str(compressed_path), vcodec='libx264', preset='fast', crf=28, acodec='aac', bitrate='128k')
-                .run(quiet=True, overwrite_output=True)
-            )
-            output_path = compressed_path
         
         return output_path
     
@@ -315,22 +308,30 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Отменено. Можешь начать заново с /start")
 
 # ========== ЗАПУСК ==========
+async def post_init(application: Application):
+    """Действия после инициализации бота"""
+    # Получаем информацию о боте
+    bot_info = await application.bot.get_me()
+    print(f"\n" + "="*70)
+    print("🎵 MUSIC VISUALIZER BOT 🎵")
+    print("="*70)
+    print(f"🤖 Бот: @{bot_info.username}")
+    print(f"📁 Временная папка: {TEMP_DIR}")
+    print(f"⏱ Макс длительность: {MAX_DURATION} сек")
+    print("🎨 Режим: визуализация под бит")
+    print("="*70 + "\n")
+
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    """Точка входа"""
+    # Создаём приложение
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     
+    # Регистрируем обработчики
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(MessageHandler(filters.AUDIO | filters.VOICE, handle_audio))
     
-    print("\n" + "="*70)
-    print("🎵 MUSIC VISUALIZER BOT 🎵")
-    print("="*70)
-    print(f"🤖 Бот: @{app.bot.username}")
-    print(f"📁 Временная папка: {TEMP_DIR}")
-    print(f"⏱ Макс длительность: {MAX_DURATION} сек")
-    print("🎨 Режим: визуализация под бит")
-    print("="*70)
-    
+    # Запускаем бота
     app.run_polling()
 
 if __name__ == '__main__':
