@@ -1,4 +1,5 @@
 python-telegram-bot==20.7
+yt-dlp
 librosa==0.10.1
 numpy==1.24.3
 moviepy==1.0.3
