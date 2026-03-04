@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Music Visualizer Bot с поддержкой YouTube
+# Music Visualizer Bot - Оптимизированная версия для Railway
 
 import os
 import sys
@@ -10,12 +10,16 @@ import shutil
 import random
 import math
 import colorsys
+import base64
+import tempfile
 from pathlib import Path
+from typing import Optional, Tuple
+import subprocess
 
 import numpy as np
 import librosa
-import yt_dlp  # заменяем на yt-dlp
-from moviepy.editor import VideoClip, AudioFileClip
+import yt_dlp
+from moviepy.editor import VideoClip, AudioFileClip, VideoFileClip
 import ffmpeg
 
 from telegram import Update
@@ -23,72 +27,191 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from telegram.constants import ParseMode
 
 # ========== НАСТРОЙКА ==========
-logging.basicConfig(format='%(asctime)s - %(message)s', level=logging.INFO)
+logging.basicConfig(
+    format='%(asime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
+# Проверка токена
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 if not BOT_TOKEN:
     logger.error("❌ BOT_TOKEN не установлен!")
     sys.exit(1)
 
+# Конфигурация
 VIDEO_WIDTH = 1280
 VIDEO_HEIGHT = 720
 FPS = 30
-MAX_DURATION = 60
-TEMP_DIR = Path("temp")
-TEMP_DIR.mkdir(exist_ok=True)
+MAX_DURATION = 60  # секунд
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB для Telegram
 
-# ========== КЛАСС ДЛЯ ЮТУБА ==========
+# Временные папки
+TEMP_DIR = Path("/tmp/music_visualizer")
+TEMP_DIR.mkdir(parents=True, exist_ok=True)
+
+# Куки из переменных окружения (опционально)
+YOUTUBE_COOKIES = os.getenv('YOUTUBE_COOKIES', '')
+
+# ========== КЛАСС ДЛЯ ЗАГРУЗКИ С ЮТУБА ==========
 class YouTubeDownloader:
-    """Скачивает видео с YouTube с обходом блокировок"""
+    """Скачивает аудио с YouTube с обходом блокировок"""
     
-    @staticmethod
-    async def download(url: str) -> Path:
-        logger.info(f"📥 Скачиваю: {url}")
+    def __init__(self):
+        self.temp_dir = TEMP_DIR / f"yt_{uuid.uuid4().hex[:8]}"
+        self.temp_dir.mkdir(exist_ok=True)
+        self.cookies_file = None
         
-        # Настройки для обхода детекта ботов
-        ydl_opts = {
-            'format': 'best[height<=480]',  # 480p для быстрой загрузки
-            'outtmpl': str(TEMP_DIR / f'yt_{uuid.uuid4().hex}.%(ext)s'),
+        # Сохраняем куки если есть
+        if YOUTUBE_COOKIES:
+            try:
+                self.cookies_file = self.temp_dir / "cookies.txt"
+                cookies_data = base64.b64decode(YOUTUBE_COOKIES).decode('utf-8')
+                self.cookies_file.write_text(cookies_data)
+                logger.info("✅ Куки загружены из переменных окружения")
+            except Exception as e:
+                logger.warning(f"⚠️ Ошибка загрузки кук: {e}")
+                self.cookies_file = None
+    
+    def _get_ydl_opts(self, format_type: str = 'best') -> dict:
+        """Базовые опции для yt-dlp"""
+        opts = {
+            'format': 'bestaudio/best',
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }],
+            'outtmpl': str(self.temp_dir / '%(title)s.%(ext)s'),
             'quiet': True,
             'no_warnings': True,
             'extract_flat': False,
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['android', 'web'],  # эмуляция клиентов
-                    'skip': ['hls', 'dash'],
-                }
-            },
-            # Имитация браузера
+            'ignoreerrors': True,
+            'geo_bypass': True,
+            
+            # Эмуляция браузера
             'http_headers': {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'Accept-Language': 'en-us,en;q=0.5',
-                'Sec-Fetch-Mode': 'navigate',
-            }
+                'Accept-Language': 'en-US,en;q=0.9,ru;q=0.8',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'DNT': '1',
+                'Connection': 'keep-alive',
+            },
+            
+            # Таймауты
+            'socket_timeout': 30,
+            'retries': 3,
+            'fragment_retries': 3,
+            
+            # Избегаем проверки сертификатов
+            'nocheckcertificate': True,
         }
         
+        # Добавляем куки если есть
+        if self.cookies_file and self.cookies_file.exists():
+            opts['cookiefile'] = str(self.cookies_file)
+        
+        return opts
+    
+    async def download_audio(self, url: str) -> Optional[Path]:
+        """
+        Скачивает аудио с YouTube
+        Возвращает путь к mp3 файлу или None
+        """
+        logger.info(f"📥 Загрузка: {url}")
+        
+        # Пробуем разные стратегии
+        strategies = [
+            {'player_client': ['web']},  # Обычный веб-клиент
+            {'player_client': ['android']},  # Android клиент (меньше проверок)
+            {'player_client': ['ios']},  # iOS клиент
+            {'player_client': ['tv']},  # TV клиент
+        ]
+        
+        for i, strategy in enumerate(strategies):
+            try:
+                logger.info(f"🔄 Попытка {i+1}/{len(strategies)}...")
+                
+                opts = self._get_ydl_opts()
+                opts['extractor_args'] = {
+                    'youtube': {
+                        'player_client': strategy['player_client'],
+                        'skip': ['hls', 'dash'],
+                    }
+                }
+                
+                # Для мобильных клиентов используем меньшее качество
+                if 'android' in strategy['player_client'] or 'ios' in strategy['player_client']:
+                    opts['format'] = 'worstaudio/worst'
+                
+                loop = asyncio.get_event_loop()
+                
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    # Скачиваем информацию
+                    info = await loop.run_in_executor(
+                        None, 
+                        lambda: ydl.extract_info(url, download=True)
+                    )
+                    
+                    if info is None:
+                        continue
+                    
+                    # Ищем скачанный файл
+                    audio_files = list(self.temp_dir.glob("*.mp3"))
+                    if audio_files:
+                        audio_path = audio_files[0]
+                        logger.info(f"✅ Скачано: {audio_path.name}")
+                        
+                        # Проверяем размер
+                        size = audio_path.stat().st_size
+                        if size > MAX_FILE_SIZE:
+                            logger.warning(f"⚠️ Файл слишком большой: {size/1024/1024:.1f}MB")
+                            return None
+                        
+                        return audio_path
+                    
+            except Exception as e:
+                logger.warning(f"❌ Стратегия {i+1} не удалась: {str(e)[:50]}")
+                continue
+        
+        # Если ничего не сработало, пробуем через youtube-dl как fallback
         try:
+            logger.info("🔄 Пробую youtube-dl...")
+            import youtube_dl
+            
+            ydl_opts = {
+                'format': 'bestaudio/best',
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '192',
+                }],
+                'outtmpl': str(self.temp_dir / '%(title)s.%(ext)s'),
+                'quiet': True,
+                'no_warnings': True,
+            }
+            
             loop = asyncio.get_event_loop()
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                # Извлекаем информацию и скачиваем
-                info = await loop.run_in_executor(None, ydl.extract_info, url, True)
-                filename = ydl.prepare_filename(info)
+            with youtube_dl.YoutubeDL(ydl_opts) as ydl:
+                info = await loop.run_in_executor(
+                    None, 
+                    lambda: ydl.extract_info(url, download=True)
+                )
                 
-                # Ищем файл (может быть .mp4 или другой)
-                path = Path(filename)
-                if not path.exists():
-                    # Пробуем найти любой видеофайл
-                    files = list(TEMP_DIR.glob(f"*{path.stem}*"))
-                    if files:
-                        path = files[0]
-                
-                logger.info(f"✅ Скачано: {path.name}")
-                return path
-                
+                audio_files = list(self.temp_dir.glob("*.mp3"))
+                if audio_files:
+                    return audio_files[0]
+                    
         except Exception as e:
-            logger.error(f"❌ Ошибка YouTube: {e}")
-            raise
+            logger.error(f"❌ youtube-dl тоже не сработал: {e}")
+        
+        return None
+    
+    def cleanup(self):
+        """Очистка временных файлов"""
+        if self.temp_dir.exists():
+            shutil.rmtree(self.temp_dir, ignore_errors=True)
 
 # ========== ВИЗУАЛИЗАТОР ==========
 class BeatVisualizer:
@@ -96,202 +219,346 @@ class BeatVisualizer:
     
     def __init__(self, audio_path: Path):
         self.audio_path = audio_path
-        self.work_dir = TEMP_DIR / f"viz_{uuid.uuid4().hex}"
+        self.work_dir = TEMP_DIR / f"viz_{uuid.uuid4().hex[:8]}"
         self.work_dir.mkdir(parents=True, exist_ok=True)
         
-        # Анализ аудио
-        self.y, self.sr = librosa.load(str(audio_path))
-        self.duration = len(self.y) / self.sr
-        self.tempo, self.beat_frames = librosa.beat.beat_track(y=self.y, sr=self.sr)
-        self.beat_times = librosa.frames_to_time(self.beat_frames, sr=self.sr)
-        self.spectral = librosa.feature.spectral_centroid(y=self.y, sr=self.sr)[0]
+        # Загружаем аудио
+        logger.info("🎵 Анализ аудио...")
+        self.y, self.sr = librosa.load(str(audio_path), duration=MAX_DURATION)
+        self.duration = min(len(self.y) / self.sr, MAX_DURATION)
         
-        logger.info(f"🎵 Аудио: {self.duration:.1f} сек, BPM: {self.tempo:.1f}")
+        # Анализ битов
+        self.tempo, self.beat_frames = librosa.beat.beat_track(
+            y=self.y, 
+            sr=self.sr,
+            units='time'
+        )
+        
+        # Спектральные характеристики
+        self.spectral = librosa.feature.spectral_centroid(y=self.y, sr=self.sr)[0]
+        self.onset_env = librosa.onset.onset_strength(y=self.y, sr=self.sr)
+        
+        logger.info(f"✅ Длительность: {self.duration:.1f}с, BPM: {self.tempo:.1f}")
     
-    def get_beat_energy(self, t: float) -> float:
-        """Энергия бита (0-1)"""
-        if len(self.beat_times) == 0:
-            return 0.5
-        closest = min(self.beat_times, key=lambda x: abs(x - t))
-        distance = abs(closest - t)
-        return math.exp(-distance * 30) if distance < 0.2 else 0.1
+    def get_energy(self, t: float) -> float:
+        """Энергия звука в момент t"""
+        idx = min(int(t * self.sr / 512), len(self.onset_env)-1)
+        if idx < 0:
+            return 0.1
+        return float(np.clip(self.onset_env[idx] / self.onset_env.max(), 0.1, 1.0))
     
-    def get_color(self, t: float) -> tuple:
+    def get_color(self, t: float) -> Tuple[int, int, int]:
         """Цвет на основе частоты"""
         idx = min(int(t * self.sr / 512), len(self.spectral)-1)
-        freq = self.spectral[idx] if idx >= 0 else 2000
+        if idx < 0:
+            freq = 2000
+        else:
+            freq = self.spectral[idx]
+        
+        # Преобразуем частоту в цвет
         hue = (freq / 5000) % 1.0
-        energy = self.get_beat_energy(t)
-        r, g, b = colorsys.hsv_to_rgb(hue, 0.8, 0.3 + energy * 0.7)
+        energy = self.get_energy(t)
+        
+        r, g, b = colorsys.hsv_to_rgb(hue, 0.9, 0.5 + energy * 0.5)
         return (int(r*255), int(g*255), int(b*255))
     
-    def make_frame(self, t: float) -> np.array:
-        """Создаёт кадр"""
+    def make_frame(self, t: float) -> np.ndarray:
+        """Создаёт кадр для момента t"""
         frame = np.zeros((VIDEO_HEIGHT, VIDEO_WIDTH, 3), dtype=np.uint8)
         
-        # Фон
-        bg_color = self.get_color(t - 0.1)
-        frame[:, :] = [c // 4 for c in bg_color]
-        
-        # Центральный круг
+        # Текущие параметры
         color = self.get_color(t)
-        energy = self.get_beat_energy(t)
-        radius = int(min(VIDEO_WIDTH, VIDEO_HEIGHT) * (0.2 + energy * 0.8) * 0.25)
-        center_x, center_y = VIDEO_WIDTH // 2, VIDEO_HEIGHT // 2
+        energy = self.get_energy(t)
         
+        # Центр экрана
+        cx, cy = VIDEO_WIDTH // 2, VIDEO_HEIGHT // 2
+        
+        # Радиус пульсирует в такт
+        radius = int(min(VIDEO_WIDTH, VIDEO_HEIGHT) * 0.25 * (0.6 + energy * 0.8))
+        
+        # Создаём сетку координат
         Y, X = np.ogrid[:VIDEO_HEIGHT, :VIDEO_WIDTH]
-        dist = np.sqrt((X - center_x)**2 + (Y - center_y)**2)
-        frame[dist <= radius] = color
+        dist = np.sqrt((X - cx)**2 + (Y - cy)**2)
         
-        # Кольцо
-        if energy > 0.4:
-            ring = (dist <= radius * 1.3) & (dist > radius)
-            ring_color = tuple(min(c + 30, 255) for c in color)
-            frame[ring] = ring_color
+        # Рисуем круг
+        mask = dist <= radius
+        frame[mask] = color
+        
+        # Рисуем кольцо если высокая энергия
+        if energy > 0.3:
+            ring_mask = (dist <= radius + 20) & (dist > radius)
+            ring_color = tuple(min(c + 50, 255) for c in color)
+            frame[ring_mask] = ring_color
+        
+        # Добавляем шум для эффекта
+        if energy > 0.7:
+            noise = np.random.randint(0, 30, frame.shape, dtype=np.uint8)
+            frame = np.clip(frame.astype(np.int16) + noise, 0, 255).astype(np.uint8)
         
         return frame
     
-    def create_video(self) -> Path:
-        """Создаёт видео из аудио"""
+    def create_video(self) -> Optional[Path]:
+        """Создаёт видео"""
         output_path = self.work_dir / "visualizer.mp4"
         
-        video_duration = min(self.duration, MAX_DURATION)
-        video_clip = VideoClip(self.make_frame, duration=video_duration)
-        video_clip = video_clip.set_fps(FPS)
+        try:
+            logger.info("🎬 Создание видео...")
+            
+            # Создаём видеоклип
+            video_clip = VideoClip(self.make_frame, duration=self.duration)
+            video_clip = video_clip.set_fps(FPS)
+            
+            # Добавляем аудио
+            audio_clip = AudioFileClip(str(self.audio_path)).subclip(0, self.duration)
+            final_clip = video_clip.set_audio(audio_clip)
+            
+            # Экспортируем
+            final_clip.write_videofile(
+                str(output_path),
+                fps=FPS,
+                codec='libx264',
+                preset='ultrafast',  # Быстрое сжатие
+                bitrate='1000k',  # Невысокий битрейт для экономии места
+                audio_codec='aac',
+                audio_bitrate='128k',
+                threads=2,
+                verbose=False,
+                logger=None
+            )
+            
+            # Закрываем клипы
+            video_clip.close()
+            audio_clip.close()
+            final_clip.close()
+            
+            if output_path.exists():
+                size_mb = output_path.stat().st_size / 1024 / 1024
+                logger.info(f"✅ Видео готово: {size_mb:.1f}MB")
+                return output_path
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка создания видео: {e}")
         
-        audio_clip = AudioFileClip(str(self.audio_path)).subclip(0, video_duration)
-        final_clip = video_clip.set_audio(audio_clip)
-        
-        final_clip.write_videofile(
-            str(output_path),
-            fps=FPS,
-            codec='libx264',
-            preset='medium',
-            bitrate='2000k',
-            audio_codec='aac',
-            audio_bitrate='192k',
-            threads=4,
-            verbose=False,
-            logger=None
-        )
-        
-        return output_path
+        return None
     
     def cleanup(self):
+        """Очистка временных файлов"""
         if self.work_dir.exists():
-            shutil.rmtree(self.work_dir)
+            shutil.rmtree(self.work_dir, ignore_errors=True)
 
 # ========== ТЕЛЕГРАМ-БОТ ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /start"""
     await update.message.reply_text(
         "🎵 **Music Visualizer Bot**\n\n"
-        "Отправь **ссылку на YouTube** или **аудиофайл**, "
-        "а я сделаю клип с визуализацией под бит!\n\n"
-        f"⏱ Макс длительность: {MAX_DURATION} сек",
+        "Отправь мне **ссылку на YouTube** или **аудиофайл**, "
+        "и я создам визуализацию под бит!\n\n"
+        f"⏱ Макс. длительность: {MAX_DURATION} сек\n"
+        "⚡️ Работает даже при блокировках YouTube",
         parse_mode=ParseMode.MARKDOWN
     )
 
 async def handle_youtube(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка ссылок YouTube"""
+    """Обработка YouTube ссылок"""
     url = update.message.text.strip()
     
-    if not ('youtu.be' in url or 'youtube.com' in url):
-        await update.message.reply_text("❌ Это не ссылка YouTube")
+    # Проверяем что это YouTube
+    if not any(domain in url for domain in ['youtu.be', 'youtube.com', 'm.youtube.com']):
+        await update.message.reply_text("❌ Пожалуйста, отправьте ссылку на YouTube")
         return
     
-    status = await update.message.reply_text("⏳ Скачиваю видео с YouTube...")
+    # Отправляем статус
+    status_msg = await update.message.reply_text(
+        "⏳ **Шаг 1/3**: Подключение к YouTube...\n"
+        "Это может занять до 30 секунд",
+        parse_mode=ParseMode.MARKDOWN
+    )
+    
+    downloader = None
     
     try:
-        # Скачиваем видео
-        video_path = await YouTubeDownloader.download(url)
+        # Скачиваем аудио
+        downloader = YouTubeDownloader()
+        audio_path = await downloader.download_audio(url)
         
-        # Извлекаем аудио
-        audio_path = TEMP_DIR / f"audio_{uuid.uuid4().hex}.mp3"
-        (
-            ffmpeg
-            .input(str(video_path))
-            .output(str(audio_path))
-            .run(quiet=True, overwrite_output=True)
+        if not audio_path:
+            await status_msg.edit_text(
+                "❌ Не удалось скачать видео с YouTube.\n"
+                "Возможные причины:\n"
+                "• Видео недоступно в вашем регионе\n"
+                "• YouTube временно блокирует запросы\n"
+                "• Слишком длинное видео\n\n"
+                "Попробуйте другое видео или отправьте аудиофайл"
+            )
+            return
+        
+        # Проверяем размер
+        file_size = audio_path.stat().st_size / 1024 / 1024
+        await status_msg.edit_text(
+            f"✅ **Шаг 2/3**: Аудио загружено ({file_size:.1f} MB)\n"
+            "🎨 Создаю визуализацию...",
+            parse_mode=ParseMode.MARKDOWN
         )
         
         # Создаём визуализацию
-        await status.edit_text("🎨 Создаю визуализацию под бит...")
         visualizer = BeatVisualizer(audio_path)
-        result_path = visualizer.create_video()
+        video_path = visualizer.create_video()
         
-        # Отправляем
-        await status.edit_text("📤 Отправляю...")
-        with open(result_path, 'rb') as f:
+        if not video_path:
+            await status_msg.edit_text("❌ Ошибка при создании видео")
+            return
+        
+        # Отправляем видео
+        await status_msg.edit_text(
+            "📤 **Шаг 3/3**: Отправка видео...\n"
+            f"BPM: {visualizer.tempo:.1f}",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        
+        with open(video_path, 'rb') as f:
             await update.message.reply_video(
                 video=f,
-                caption=f"🎵 Клип под бит | BPM: {visualizer.tempo:.1f}",
-                supports_streaming=True
+                caption=f"🎵 Визуализация | BPM: {visualizer.tempo:.1f}",
+                supports_streaming=True,
+                width=VIDEO_WIDTH,
+                height=VIDEO_HEIGHT
             )
         
         # Очистка
         visualizer.cleanup()
-        video_path.unlink(missing_ok=True)
-        audio_path.unlink(missing_ok=True)
-        await status.delete()
+        await status_msg.delete()
         
     except Exception as e:
-        logger.error(f"Ошибка: {e}")
-        await status.edit_text(f"❌ Ошибка: {str(e)[:100]}\nYouTube мог заблокировать запрос.")
+        logger.error(f"❌ Ошибка: {e}", exc_info=True)
+        await status_msg.edit_text(
+            f"❌ Произошла ошибка: {str(e)[:100]}"
+        )
+    finally:
+        if downloader:
+            downloader.cleanup()
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка аудиофайлов"""
+    # Получаем файл
     audio = update.message.audio or update.message.voice
     if not audio:
         return
     
-    status = await update.message.reply_text("⏳ Обрабатываю аудио...")
+    status_msg = await update.message.reply_text(
+        "⏳ **Шаг 1/2**: Загрузка аудио...",
+        parse_mode=ParseMode.MARKDOWN
+    )
     
-    ext = '.mp3' if update.message.audio else '.ogg'
-    audio_path = TEMP_DIR / f"audio_{uuid.uuid4().hex}{ext}"
+    # Определяем расширение
+    if update.message.audio:
+        ext = Path(audio.file_name).suffix if audio.file_name else '.mp3'
+    else:
+        ext = '.ogg'
     
-    file = await context.bot.get_file(audio.file_id)
-    await file.download_to_drive(audio_path)
+    # Скачиваем файл
+    audio_path = TEMP_DIR / f"audio_{uuid.uuid4().hex[:8]}{ext}"
     
     try:
-        visualizer = BeatVisualizer(audio_path)
-        result_path = visualizer.create_video()
+        file = await context.bot.get_file(audio.file_id)
+        await file.download_to_drive(audio_path)
         
-        with open(result_path, 'rb') as f:
+        file_size = audio_path.stat().st_size / 1024 / 1024
+        await status_msg.edit_text(
+            f"✅ **Шаг 1/2**: Аудио загружено ({file_size:.1f} MB)\n"
+            "🎨 **Шаг 2/2**: Создаю визуализацию...",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        
+        # Конвертируем в MP3 если нужно
+        if audio_path.suffix != '.mp3':
+            mp3_path = audio_path.with_suffix('.mp3')
+            (
+                ffmpeg
+                .input(str(audio_path))
+                .output(str(mp3_path), acodec='libmp3lame', ab='192k')
+                .run(quiet=True, overwrite_output=True)
+            )
+            audio_path.unlink()
+            audio_path = mp3_path
+        
+        # Создаём визуализацию
+        visualizer = BeatVisualizer(audio_path)
+        video_path = visualizer.create_video()
+        
+        if not video_path:
+            await status_msg.edit_text("❌ Ошибка при создании видео")
+            return
+        
+        # Отправляем
+        with open(video_path, 'rb') as f:
             await update.message.reply_video(
                 video=f,
-                caption=f"🎵 Клип под бит | BPM: {visualizer.tempo:.1f}",
+                caption=f"🎵 Визуализация | BPM: {visualizer.tempo:.1f}",
                 supports_streaming=True
             )
         
         visualizer.cleanup()
-        await status.delete()
+        await status_msg.delete()
         
     except Exception as e:
-        logger.error(f"Ошибка: {e}")
-        await status.edit_text(f"❌ Ошибка: {e}")
+        logger.error(f"❌ Ошибка: {e}")
+        await status_msg.edit_text(f"❌ Ошибка: {str(e)[:100]}")
     finally:
-        audio_path.unlink(missing_ok=True)
+        if audio_path.exists():
+            audio_path.unlink()
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ Отменено")
+    """Отмена операции"""
+    await update.message.reply_text("✅ Операция отменена")
 
-async def post_init(app: Application):
-    me = await app.bot.get_me()
-    print(f"\n🤖 Бот: @{me.username}")
-    print(f"📁 Временная папка: {TEMP_DIR}")
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Статус бота"""
+    # Проверяем наличие ffmpeg
+    ffmpeg_check = subprocess.run(['which', 'ffmpeg'], capture_output=True, text=True)
+    ffmpeg_installed = ffmpeg_check.returncode == 0
+    
+    # Проверяем куки
+    cookies_configured = bool(YOUTUBE_COOKIES)
+    
+    # Свободное место
+    stat = shutil.disk_usage(TEMP_DIR)
+    free_gb = stat.free / 1024 / 1024 / 1024
+    
+    status_text = (
+        "📊 **Статус бота**\n\n"
+        f"🍪 Куки YouTube: {'✅' if cookies_configured else '❌'}\n"
+        f"🎬 FFmpeg: {'✅' if ffmpeg_installed else '❌'}\n"
+        f"💾 Свободно места: {free_gb:.1f} GB\n"
+        f"⏱ Макс. длительность: {MAX_DURATION} сек\n"
+        f"📁 Временная папка: {TEMP_DIR}"
+    )
+    
+    await update.message.reply_text(status_text, parse_mode=ParseMode.MARKDOWN)
 
 # ========== ЗАПУСК ==========
 def main():
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    """Запуск бота"""
+    # Проверяем зависимости
+    try:
+        subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
+        logger.info("✅ FFmpeg найден")
+    except:
+        logger.error("❌ FFmpeg не найден! Установите ffmpeg")
+        logger.info("На Railway добавьте в nixpacks.toml: apt-get install -y ffmpeg")
     
+    # Создаём приложение
+    app = Application.builder().token(BOT_TOKEN).build()
+    
+    # Добавляем обработчики
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("cancel", cancel))
+    app.add_handler(CommandHandler("status", status))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_youtube))
     app.add_handler(MessageHandler(filters.AUDIO | filters.VOICE, handle_audio))
     
-    print("\n🎵 MUSIC VISUALIZER BOT")
-    print("="*50)
-    app.run_polling()
+    # Запускаем
+    logger.info("🚀 Бот запущен!")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
     main()
